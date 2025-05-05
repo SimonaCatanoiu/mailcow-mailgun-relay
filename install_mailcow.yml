@@ -1,0 +1,96 @@
+---
+- name: Install Mailcow on fresh VPS
+  hosts: mailcow
+  become: true
+  vars:
+    mailcow_dir: /opt/mailcow-dockerized
+    mailcow_fqdn: mail.testmydom.org
+    timezone: Europe/Bucharest
+  tasks:
+    - name: Install dependencies
+      apt:
+        name:
+          - curl
+          - git
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Install Docker
+      shell: curl -sSL https://get.docker.com/ | CHANNEL=stable sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: Enable and start Docker
+      systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Install Docker Compose v2
+      apt:
+        name: docker-compose-plugin
+        state: present
+
+    - name: Clone Mailcow repo
+      git:
+        repo: https://github.com/mailcow/mailcow-dockerized
+        dest: "{{ mailcow_dir }}"
+        version: master
+
+    - name: Set correct umask
+      shell: umask 0022
+      args:
+        chdir: "{{ mailcow_dir }}"
+
+    - name: Generate mailcow config (non-interactive)
+      shell: |
+        echo -e "{{ mailcow_fqdn }}\n{{ timezone }}" | ./generate_config.sh
+      args:
+        chdir: "{{ mailcow_dir }}"
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Get default network interface
+      command: ip route get 1.1.1.1
+      register: route_output
+
+    - name: Extract network interface name
+      set_fact:
+        main_iface: "{{ route_output.stdout | regex_search('dev (\\S+)', '\\1') }}"
+
+    - name: Get MTU of main interface
+      command: ip link show "{{ main_iface[0] }}"
+      register: mtu_output
+
+    - name: Extract MTU value and clean the output
+      set_fact:
+        current_mtu: "{{ mtu_output.stdout | regex_search('mtu \\d+') | regex_replace('mtu ', '') }}"
+
+
+    - name: Add driver_opts for custom MTU if not 1500
+      lineinfile:
+        path: "{{ mailcow_dir }}/docker-compose.yml"
+        line: '      com.docker.network.driver.mtu: {{ current_mtu }}'
+        insertafter: '^\s*driver_opts:'
+        state: present
+      when: (current_mtu | int) != 1500
+
+    - name: Pull Mailcow images
+      shell: docker compose pull
+      args:
+        chdir: "{{ mailcow_dir }}"
+
+    - name: Start Mailcow
+      shell: docker compose up -d
+      args:
+        chdir: "{{ mailcow_dir }}"
+
+  handlers:
+    - name: Restart Mailcow
+      shell: docker compose restart
+      args:
+        chdir: "{{ mailcow_dir }}"
